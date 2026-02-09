@@ -1,0 +1,466 @@
+*&---------------------------------------------------------------------*
+*& Report  zejercicio_talleria_ep.
+*&---------------------------------------------------------------------*
+*& Descripción:
+*&   Reporte de partidas abiertas (clientes/proveedores) por sociedad y
+*&   rango de fechas. Calcula aging (días abiertos + bucket) y convierte
+*&   el importe a una moneda de reporte (ej. USD) usando tipo de cambio.
+*&
+*& Notas:
+*&   - Lectura: BSID (clientes) y BSIK (proveedores) + nombres (KNA1/LFA1)
+*&   - Aging calculado contra SY-DATUM con base en BUDAT
+*&   - Conversión: FM CONVERT_TO_FOREIGN_CURRENCY
+*&   - Visualización: CL_SALV_TABLE
+*&---------------------------------------------------------------------*
+REPORT zejercicio_talleria_ep.
+
+TYPE-POOLS icon.
+
+" -----------------------------------------------------------------------
+" Tipos
+" -----------------------------------------------------------------------
+TYPES: BEGIN OF ty_selection,
+         bukrs      TYPE bukrs, " Sociedad
+         budat_low  TYPE budat, " Fecha contabilización inicial
+         budat_high TYPE budat, " Fecha contabilización final
+         rep_waers  TYPE waers, " Moneda reporte
+         kurst      TYPE kurst, " Tipo de cambio
+       END OF ty_selection.
+
+TYPES: BEGIN OF ty_fi_open_item,
+         bukrs       TYPE bukrs,     " Sociedad
+         partner     TYPE char10,    " Cliente/Proveedor (normalizado a char10 para demo)
+         name1       TYPE name1_gp,  " Nombre del interlocutor
+         belnr       TYPE belnr_d,   " Documento contable
+         budat       TYPE budat,     " Fecha de contabilización
+         bldat       TYPE bldat,     " Fecha del documento
+         waers       TYPE waers,     " Moneda original
+         wrbtr       TYPE wrbtr,     " Importe original (en WAERS)
+         rep_waers   TYPE waers,     " Moneda reporte
+         wrbtr_rep   TYPE wrbtr,     " Importe convertido (en REP_WAERS)
+         conv_error  TYPE abap_bool, " Error de conversión
+         conv_msg    TYPE string,    " Mensaje conversión
+         days_open   TYPE i,         " Días abiertos
+         aging_cat   TYPE char10,    " Categoría de antigüedad
+         status_icon TYPE icon_d,    " Semáforo
+       END OF ty_fi_open_item.
+
+TYPES ty_t_fi_open_item TYPE STANDARD TABLE OF ty_fi_open_item WITH EMPTY KEY.
+
+" Parámetros de conversión
+TYPES: BEGIN OF ty_conversion_params,
+         amount_from   TYPE wrbtr, " Importe a convertir
+         currency_from TYPE waers, " Moneda origen
+         currency_to   TYPE waers, " Moneda destino
+         conv_date     TYPE budat, " Fecha para tipo de cambio
+         exch_type     TYPE kurst, " Tipo de cambio
+       END OF ty_conversion_params.
+
+TYPES: BEGIN OF ty_conversion_result,
+         amount_to TYPE wrbtr, " Importe convertido
+         ok        TYPE abap_bool,
+         message   TYPE string,
+       END OF ty_conversion_result.
+
+" -----------------------------------------------------------------------
+" Excepción local de validación
+" -----------------------------------------------------------------------
+CLASS lcx_validation DEFINITION INHERITING FROM cx_static_check FINAL.
+  PUBLIC SECTION.
+    DATA mv_text TYPE string READ-ONLY.
+
+    METHODS constructor IMPORTING iv_text TYPE string.
+ENDCLASS.
+
+
+CLASS lcx_validation IMPLEMENTATION.
+  METHOD constructor.
+    super->constructor( ).
+    mv_text = iv_text.
+  ENDMETHOD.
+ENDCLASS.
+
+
+" -----------------------------------------------------------------------
+" Data Access (SRP: solo lecturas)
+" -----------------------------------------------------------------------
+CLASS lcl_data_access DEFINITION FINAL.
+  PUBLIC SECTION.
+    "! Obtiene partidas abiertas de clientes y proveedores por sociedad/fechas.
+    "!
+    "! @parameter iv_bukrs |
+    "! @parameter iv_date_from |
+    "! @parameter iv_date_to |
+    "! @parameter rt_items |
+    METHODS get_open_items
+      IMPORTING iv_bukrs        TYPE bukrs
+                iv_date_from    TYPE budat
+                iv_date_to      TYPE budat
+      RETURNING VALUE(rt_items) TYPE ty_t_fi_open_item.
+
+  PRIVATE SECTION.
+    METHODS fetch_customer_items
+      IMPORTING iv_bukrs        TYPE bukrs
+                iv_date_from    TYPE budat
+                iv_date_to      TYPE budat
+      RETURNING VALUE(rt_items) TYPE ty_t_fi_open_item.
+
+    METHODS fetch_vendor_items
+      IMPORTING iv_bukrs        TYPE bukrs
+                iv_date_from    TYPE budat
+                iv_date_to      TYPE budat
+      RETURNING VALUE(rt_items) TYPE ty_t_fi_open_item.
+
+    METHODS calculate_days_and_bucket
+      CHANGING ct_items TYPE ty_t_fi_open_item.
+ENDCLASS.
+
+
+CLASS lcl_data_access IMPLEMENTATION.
+  METHOD get_open_items.
+    DATA(lt_customer_items) = fetch_customer_items( iv_bukrs     = iv_bukrs
+                                                    iv_date_from = iv_date_from
+                                                    iv_date_to   = iv_date_to ).
+
+    DATA(lt_vendor_items) = fetch_vendor_items( iv_bukrs     = iv_bukrs
+                                                iv_date_from = iv_date_from
+                                                iv_date_to   = iv_date_to ).
+
+    rt_items = VALUE #( BASE lt_customer_items FOR ls_vendor IN lt_vendor_items
+                        ( ls_vendor ) ).
+
+    calculate_days_and_bucket( CHANGING ct_items = rt_items ).
+  ENDMETHOD.
+
+  METHOD fetch_customer_items.
+    " BSID: partidas abiertas clientes
+    SELECT b~bukrs,
+           b~kunnr AS partner,
+           k~name1,
+           b~belnr,
+           b~budat,
+           b~bldat,
+           b~waers,
+           b~wrbtr
+      FROM bsid AS b
+             INNER JOIN
+               kna1 AS k ON k~kunnr = b~kunnr
+      WHERE b~bukrs       = @iv_bukrs
+        AND b~budat BETWEEN @iv_date_from AND @iv_date_to
+      INTO CORRESPONDING FIELDS OF TABLE @rt_items.
+  ENDMETHOD.
+
+  METHOD fetch_vendor_items.
+    " BSIK: partidas abiertas proveedores
+    SELECT b~bukrs,
+           b~lifnr AS partner,
+           l~name1,
+           b~belnr,
+           b~budat,
+           b~bldat,
+           b~waers,
+           b~wrbtr
+      FROM bsik AS b
+             INNER JOIN
+               lfa1 AS l ON l~lifnr = b~lifnr
+      WHERE b~bukrs       = @iv_bukrs
+        AND b~budat BETWEEN @iv_date_from AND @iv_date_to
+      INTO CORRESPONDING FIELDS OF TABLE @rt_items.
+  ENDMETHOD.
+
+  METHOD calculate_days_and_bucket.
+    LOOP AT ct_items ASSIGNING FIELD-SYMBOL(<ls_item>).
+      <ls_item>-days_open = sy-datum - <ls_item>-budat.
+
+      IF <ls_item>-days_open <= 30.
+        <ls_item>-aging_cat   = '0-30'.
+        <ls_item>-status_icon = icon_green_light.
+      ELSEIF <ls_item>-days_open <= 60.
+        <ls_item>-aging_cat   = '31-60'.
+        <ls_item>-status_icon = icon_yellow_light.
+      ELSEIF <ls_item>-days_open <= 90.
+        <ls_item>-aging_cat   = '61-90'.
+        <ls_item>-status_icon = icon_light_out. " neutro (puedes cambiar a otro icono)
+      ELSE.
+        <ls_item>-aging_cat   = '>90'.
+        <ls_item>-status_icon = icon_red_light.
+      ENDIF.
+    ENDLOOP.
+  ENDMETHOD.
+ENDCLASS.
+
+
+" -----------------------------------------------------------------------
+" Currency Converter (SRP: solo conversión)
+" -----------------------------------------------------------------------
+CLASS lcl_currency_converter DEFINITION FINAL.
+  PUBLIC SECTION.
+    "! Convierte un monto de moneda origen a destino.
+    "!
+    "! @parameter is_params |
+    "! @parameter rs_result |
+    METHODS convert_amount
+      IMPORTING is_params        TYPE ty_conversion_params
+      RETURNING VALUE(rs_result) TYPE ty_conversion_result.
+ENDCLASS.
+
+
+CLASS lcl_currency_converter IMPLEMENTATION.
+  METHOD convert_amount.
+    CLEAR rs_result.
+    rs_result-ok = abap_false.
+
+    IF is_params-currency_from IS INITIAL OR is_params-currency_to IS INITIAL.
+      rs_result-message = 'Moneda origen/destino no puede estar vacía'.
+      RETURN.
+    ENDIF.
+
+    IF is_params-conv_date IS INITIAL.
+      rs_result-message = 'Fecha de conversión no puede estar vacía'.
+      RETURN.
+    ENDIF.
+
+    IF is_params-exch_type IS INITIAL.
+      rs_result-message = 'Tipo de cambio (KURST) no puede estar vacío'.
+      RETURN.
+    ENDIF.
+
+    IF is_params-currency_from = is_params-currency_to.
+      rs_result-amount_to = is_params-amount_from.
+      rs_result-ok        = abap_true.
+      rs_result-message   = 'Conversión no requerida (monedas iguales)'.
+      RETURN.
+    ENDIF.
+
+    DATA lv_amount_to TYPE wrbtr.
+
+    CALL FUNCTION 'CONVERT_TO_FOREIGN_CURRENCY'
+      EXPORTING  client           = sy-mandt
+                 date             = is_params-conv_date
+                 foreign_currency = is_params-currency_to
+                 local_currency   = is_params-currency_from
+                 local_amount     = is_params-amount_from
+                 type_of_rate     = is_params-exch_type
+      IMPORTING  foreign_amount   = lv_amount_to
+      EXCEPTIONS no_rate_found    = 1
+                 overflow         = 2
+                 OTHERS           = 3.
+
+    IF sy-subrc <> 0.
+      rs_result-message = SWITCH string( sy-subrc
+                                         WHEN 1 THEN 'No se encontró tipo de cambio (TCURR)'
+                                         WHEN 2 THEN 'Desbordamiento en la conversión'
+                                         ELSE        'Error desconocido en la conversión' ).
+      RETURN.
+    ENDIF.
+
+    rs_result-amount_to = lv_amount_to.
+    rs_result-ok        = abap_true.
+    rs_result-message   = 'Conversión exitosa'.
+  ENDMETHOD.
+ENDCLASS.
+
+
+" -----------------------------------------------------------------------
+" Business Logic (SRP: orquestación y reglas)
+" -----------------------------------------------------------------------
+CLASS lcl_business_logic DEFINITION FINAL.
+  PUBLIC SECTION.
+    "! Orquesta: valida parámetros, lee partidas abiertas y enriquece con conversión.
+    "!
+    "! @parameter is_sel |
+    "! @parameter rt_items |
+    "! @raising lcx_validation |
+    METHODS process_open_items
+      IMPORTING is_sel          TYPE ty_selection
+      RETURNING VALUE(rt_items) TYPE ty_t_fi_open_item
+      RAISING   lcx_validation.
+
+  PRIVATE SECTION.
+    METHODS validate_parameters
+      IMPORTING is_sel TYPE ty_selection
+      RAISING   lcx_validation.
+
+    METHODS enrich_with_conversion
+      IMPORTING is_sel   TYPE ty_selection
+      CHANGING  ct_items TYPE ty_t_fi_open_item.
+ENDCLASS.
+
+
+CLASS lcl_business_logic IMPLEMENTATION.
+  METHOD process_open_items.
+    validate_parameters( is_sel ).
+
+    DATA(lo_data_access) = NEW lcl_data_access( ).
+    rt_items = lo_data_access->get_open_items( iv_bukrs     = is_sel-bukrs
+                                               iv_date_from = is_sel-budat_low
+                                               iv_date_to   = is_sel-budat_high ).
+
+    enrich_with_conversion( EXPORTING is_sel   = is_sel
+                            CHANGING  ct_items = rt_items ).
+  ENDMETHOD.
+
+  METHOD validate_parameters.
+    IF is_sel-bukrs IS INITIAL.
+      RAISE EXCEPTION NEW lcx_validation( 'Sociedad (BUKRS) es obligatoria' ).
+    ENDIF.
+
+    IF is_sel-budat_low IS INITIAL OR is_sel-budat_high IS INITIAL.
+      RAISE EXCEPTION NEW lcx_validation( 'Rango de fechas (BUDAT) es obligatorio' ).
+    ENDIF.
+
+    IF is_sel-budat_low > is_sel-budat_high.
+      RAISE EXCEPTION NEW lcx_validation( 'Rango de fechas inválido: fecha inicial > fecha final' ).
+    ENDIF.
+
+    IF is_sel-rep_waers IS INITIAL.
+      RAISE EXCEPTION NEW lcx_validation( 'Moneda de reporte es obligatoria' ).
+    ENDIF.
+
+    IF is_sel-kurst IS INITIAL.
+      RAISE EXCEPTION NEW lcx_validation( 'Tipo de cambio (KURST) es obligatorio' ).
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD enrich_with_conversion.
+    DATA(lo_converter) = NEW lcl_currency_converter( ).
+
+    LOOP AT ct_items ASSIGNING FIELD-SYMBOL(<ls_item>).
+      <ls_item>-rep_waers  = is_sel-rep_waers.
+      <ls_item>-wrbtr_rep  = <ls_item>-wrbtr.
+      <ls_item>-conv_error = abap_false.
+      CLEAR <ls_item>-conv_msg.
+
+      DATA(ls_params) = VALUE ty_conversion_params( amount_from   = <ls_item>-wrbtr
+                                                    currency_from = <ls_item>-waers
+                                                    currency_to   = is_sel-rep_waers
+                                                    conv_date     = <ls_item>-budat
+                                                    exch_type     = is_sel-kurst ).
+
+      DATA(ls_result) = lo_converter->convert_amount( ls_params ).
+
+      IF ls_result-ok = abap_false.
+        <ls_item>-conv_error  = abap_true.
+        <ls_item>-conv_msg    = ls_result-message.
+        <ls_item>-status_icon = icon_red_light. " prioriza error visual
+        CONTINUE.
+      ENDIF.
+
+      <ls_item>-wrbtr_rep = ls_result-amount_to.
+      <ls_item>-conv_msg  = ls_result-message.
+    ENDLOOP.
+  ENDMETHOD.
+ENDCLASS.
+
+" -----------------------------------------------------------------------
+" Selección
+" -----------------------------------------------------------------------
+PARAMETERS:
+  p_bukrs TYPE bukrs OBLIGATORY,
+  p_low   TYPE budat OBLIGATORY,
+  p_high  TYPE budat OBLIGATORY,
+  p_rwaer TYPE waers DEFAULT 'USD' OBLIGATORY,
+  p_kurst TYPE kurst DEFAULT 'M'   OBLIGATORY.
+
+" -----------------------------------------------------------------------
+" Ejecución + ALV
+" -----------------------------------------------------------------------
+START-OF-SELECTION.
+  DATA(ls_sel) = VALUE ty_selection( bukrs      = p_bukrs
+                                     budat_low  = p_low
+                                     budat_high = p_high
+                                     rep_waers  = p_rwaer
+                                     kurst      = p_kurst ).
+
+  TRY.
+      DATA(lo_bl) = NEW lcl_business_logic( ).
+      DATA(lt_out) = lo_bl->process_open_items( ls_sel ).
+
+      IF lt_out IS INITIAL.
+        MESSAGE 'No se encontraron partidas abiertas con los filtros ingresados.' TYPE 'S'.
+        RETURN.
+      ENDIF.
+
+      DATA lo_alv TYPE REF TO cl_salv_table.
+      cl_salv_table=>factory( IMPORTING r_salv_table = lo_alv
+                              CHANGING  t_table      = lt_out ).
+
+      " Ajustes ALV
+      lo_alv->get_functions( )->set_all( abap_true ).
+      lo_alv->get_display_settings( )->set_striped_pattern( abap_true ).
+
+      " Texto de columnas (mejor legibilidad)
+      DATA(lo_cols) = lo_alv->get_columns( ).
+      lo_cols->set_optimize( abap_true ).
+
+      TRY.
+          lo_cols->get_column( 'WRBTR' )->set_short_text( 'Imp.Orig' ).
+          lo_cols->get_column( 'WRBTR' )->set_medium_text( 'Importe Orig.' ).
+          lo_cols->get_column( 'WRBTR' )->set_long_text( 'Importe Original' ).
+
+          lo_cols->get_column( 'WRBTR_REP' )->set_short_text( 'Imp.Rep' ).
+          lo_cols->get_column( 'WRBTR_REP' )->set_medium_text( 'Importe Rep.' ).
+          lo_cols->get_column( 'WRBTR_REP' )->set_long_text( 'Importe en Moneda Reporte' ).
+
+          lo_cols->get_column( 'STATUS_ICON' )->set_short_text( 'St' ).
+          lo_cols->get_column( 'STATUS_ICON' )->set_medium_text( 'Estado' ).
+          lo_cols->get_column( 'STATUS_ICON' )->set_long_text( 'Semáforo' ).
+        CATCH cx_salv_not_found.
+          " Si alguna columna no existe por cambios futuros, no abortar.
+      ENDTRY.
+
+      lo_alv->display( ).
+
+    CATCH lcx_validation INTO DATA(lx_val).
+      MESSAGE lx_val->mv_text TYPE 'E'.
+    CATCH cx_root INTO DATA(lx_root).
+      MESSAGE lx_root->get_text( ) TYPE 'E'.
+  ENDTRY.
+
+  " -----------------------------------------------------------------------
+  " Unit Tests (solo convertidor) - opcional
+  " -----------------------------------------------------------------------
+CLASS ltcl_currency_converter_test DEFINITION FINAL
+  FOR TESTING RISK LEVEL HARMLESS DURATION SHORT.
+
+  PRIVATE SECTION.
+    DATA mo_cut TYPE REF TO lcl_currency_converter.
+
+    METHODS setup.
+    METHODS test_same_currency  FOR TESTING.
+    METHODS test_empty_currency FOR TESTING.
+ENDCLASS.
+
+
+CLASS ltcl_currency_converter_test IMPLEMENTATION.
+  METHOD setup.
+    mo_cut = NEW lcl_currency_converter( ).
+  ENDMETHOD.
+
+  METHOD test_same_currency.
+    DATA(ls_params) = VALUE ty_conversion_params( amount_from   = '100.00'
+                                                  currency_from = 'EUR'
+                                                  currency_to   = 'EUR'
+                                                  conv_date     = sy-datum
+                                                  exch_type     = 'M' ).
+
+    DATA(ls_result) = mo_cut->convert_amount( ls_params ).
+
+    cl_abap_unit_assert=>assert_true( act = ls_result-ok ).
+    cl_abap_unit_assert=>assert_equals( exp = '100.00'
+                                        act = ls_result-amount_to ).
+  ENDMETHOD.
+
+  METHOD test_empty_currency.
+    DATA(ls_params) = VALUE ty_conversion_params( amount_from   = '100.00'
+                                                  currency_from = ''
+                                                  currency_to   = 'USD'
+                                                  conv_date     = sy-datum
+                                                  exch_type     = 'M' ).
+
+    DATA(ls_result) = mo_cut->convert_amount( ls_params ).
+
+    cl_abap_unit_assert=>assert_false( act = ls_result-ok ).
+    cl_abap_unit_assert=>assert_not_initial( act = ls_result-message ).
+  ENDMETHOD.
+ENDCLASS.
